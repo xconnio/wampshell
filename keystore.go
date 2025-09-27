@@ -45,9 +45,14 @@ func (k *KeyStore) OnUpdate(cb func(map[string][]string)) {
 func (k *KeyStore) Update(keys map[string][]string) {
 	k.Lock()
 	defer k.Unlock()
-	k.keys = keys
+
+	for realm, newList := range keys {
+		existing := k.keys[realm]
+		k.keys[realm] = append(existing[:0:0], newList...)
+	}
+
 	if k.onUpdate != nil {
-		go k.onUpdate(keys)
+		go k.onUpdate(k.keys)
 	}
 }
 

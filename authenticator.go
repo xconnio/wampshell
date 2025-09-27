@@ -28,7 +28,7 @@ func (a *ServerAuthenticator) Authenticate(request auth.Request) (auth.Response,
 		return auth.NewResponse("", "anonymous", 0)
 	}
 
-	return nil, fmt.Errorf("unauthorized")
+	return nil, fmt.Errorf("invalid credentials")
 }
 
 func (a *ServerAuthenticator) Realms() map[string][]string {

@@ -14,32 +14,27 @@ type KeyPair struct {
 }
 
 type EncryptionManager struct {
-	router *xconn.Router
+	session *xconn.Session
 
 	keys map[uint64]*KeyPair
 
 	sync.Mutex
 }
 
-func NewEncryptionManager(router *xconn.Router) *EncryptionManager {
+func NewEncryptionManager(session *xconn.Session) *EncryptionManager {
 	return &EncryptionManager{
-		router: router,
-		keys:   make(map[uint64]*KeyPair),
+		session: session,
+		keys:    make(map[uint64]*KeyPair),
 	}
 }
 
 func (e *EncryptionManager) Setup() error {
-	session, err := xconn.ConnectInMemory(e.router, "wampshell")
-	if err != nil {
-		return err
-	}
-
-	response := session.Register("wampshell.key.exchange", e.HandleKeyExchange).Do()
+	response := e.session.Register("wampshell.key.exchange", e.HandleKeyExchange).Do()
 	if response.Err != nil {
 		return response.Err
 	}
 
-	response = session.Register("wampshell.payload.echo", e.TestEcho).Do()
+	response = e.session.Register("wampshell.payload.echo", e.TestEcho).Do()
 	if response.Err != nil {
 		return response.Err
 	}
