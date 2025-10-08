@@ -45,9 +45,14 @@ func (k *KeyStore) OnUpdate(cb func(map[string][]string)) {
 func (k *KeyStore) Update(keys map[string][]string) {
 	k.Lock()
 	defer k.Unlock()
-	k.keys = keys
+
+	for realm, newList := range keys {
+		existing := k.keys[realm]
+		k.keys[realm] = append(existing[:0:0], newList...)
+	}
+
 	if k.onUpdate != nil {
-		go k.onUpdate(keys)
+		go k.onUpdate(k.keys)
 	}
 }
 
@@ -141,4 +146,25 @@ func (k *KeyStore) watch(filePath string, watcher *fsnotify.Watcher) {
 			k.Update(make(map[string][]string))
 		}
 	}
+}
+
+func (k *KeyStore) AuthorizedKeys() ([]string, error) {
+	k.RLock()
+	defer k.RUnlock()
+
+	if len(k.keys) == 0 {
+		return nil, fmt.Errorf("no keys in KeyStore")
+	}
+
+	var keys []string
+	for realm, ks := range k.keys {
+		for _, key := range ks {
+			if realm == "wampshell" {
+				keys = append(keys, key)
+			} else {
+				keys = append(keys, fmt.Sprintf("%s %s", key, realm))
+			}
+		}
+	}
+	return keys, nil
 }

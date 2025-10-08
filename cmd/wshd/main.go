@@ -29,6 +29,7 @@ const (
 	procedureExec            = "wampshell.shell.exec"
 	procedureFileUpload      = "wampshell.shell.upload"
 	procedureFileDownload    = "wampshell.shell.download"
+	procedureSyncKeys        = "wampshell.shell.keys.sync"
 	procedureWebRTCOffer     = "wampshell.webrtc.offer"
 	topicOffererOnCandidate  = "wampshell.webrtc.offerer.on_candidate"
 	topicAnswererOnCandidate = "wampshell.webrtc.answerer.on_candidate"
@@ -294,6 +295,48 @@ func addRealm(router *xconn.Router, realm string) {
 	log.Printf("Adding realm: %s", realm)
 }
 
+func SyncAuthorizedKeys(session *xconn.Session, keyStore *wampshell.KeyStore) error {
+	lines, err := keyStore.AuthorizedKeys()
+	if err != nil {
+		return fmt.Errorf("failed to get authorized keys: %w", err)
+	}
+
+	callResponse := session.Call(procedureSyncKeys).Arg(lines).Do()
+	if callResponse.Err != nil {
+		return fmt.Errorf("sync keys call failed: %w", callResponse.Err)
+	}
+
+	return nil
+}
+
+func handleSyncKeys(realm string, keyStore *wampshell.KeyStore) xconn.InvocationHandler {
+	return func(_ context.Context, inv *xconn.Invocation) *xconn.InvocationResult {
+		argList, err := inv.ArgList(0)
+		if err != nil {
+			return xconn.NewInvocationError("wamp.error.invalid_argument", err.Error())
+		}
+
+		keys := make([]string, 0, len(argList))
+		for _, item := range argList {
+			if s, ok := item.(string); ok && s != "" {
+				keys = append(keys, s)
+			}
+		}
+
+		if len(keys) == 0 {
+			return xconn.NewInvocationError("wamp.error.invalid_argument", "no valid keys provided")
+		}
+
+		newKeys := map[string][]string{
+			realm: keys,
+		}
+		keyStore.Update(newKeys)
+
+		log.Printf("Synced %d keys for realm %s from caller %d", len(keys), realm, inv.Caller())
+		return xconn.NewInvocationResult("ok")
+	}
+}
+
 func main() {
 	loadConfig, err := wampshell.LoadConfig()
 	if err != nil {
@@ -321,6 +364,17 @@ func main() {
 	addRealm(router, defaultRealm)
 	for realm := range authenticator.Realms() {
 		addRealm(router, realm)
+		if realm != defaultRealm {
+			c, err := xconn.ConnectInMemory(router, realm)
+			if err != nil {
+				log.Fatalf("Error connecting to realm %s: %v", realm, err)
+			}
+
+			r := c.Register(procedureSyncKeys, handleSyncKeys(realm, keyStore)).Do()
+			if r.Err != nil {
+				log.Fatalf("Error registering realm %s: %v", realm, r.Err)
+			}
+		}
 	}
 
 	keyStore.OnUpdate(func(keys map[string][]string) {
@@ -328,21 +382,6 @@ func main() {
 			addRealm(router, realm)
 		}
 	})
-
-	encryption := wampshell.NewEncryptionManager(router)
-	if err = encryption.Setup(); err != nil {
-		log.Fatal(err)
-	}
-
-	procedures := []struct {
-		name    string
-		handler xconn.InvocationHandler
-	}{
-		{procedureInteractive, newInteractiveShellSession().handleShell(encryption)},
-		{procedureExec, handleRunCommand(encryption)},
-		{procedureFileUpload, handleFileUpload(encryption)},
-		{procedureFileDownload, handleFileDownload(encryption)},
-	}
 
 	server := xconn.NewServer(router, authenticator, nil)
 	if server == nil {
@@ -393,12 +432,38 @@ func main() {
 			return
 		}
 
+		encryption := wampshell.NewEncryptionManager(sess)
+		if err = encryption.Setup(); err != nil {
+			log.Fatal(err)
+		}
+
+		procedures := []struct {
+			name    string
+			handler xconn.InvocationHandler
+		}{
+			{procedureInteractive, newInteractiveShellSession().handleShell(encryption)},
+			{procedureExec, handleRunCommand(encryption)},
+			{procedureFileUpload, handleFileUpload(encryption)},
+			{procedureFileDownload, handleFileDownload(encryption)},
+		}
+
 		for _, proc := range procedures {
 			registerResponse := sess.Register(proc.name, proc.handler).Do()
 			if registerResponse.Err != nil {
 				log.Fatalln(registerResponse.Err)
 			}
 			log.Printf("Procedure registered: %s", proc.name)
+		}
+
+		if sess.Details().Realm() != defaultRealm {
+			_, err := wampshell.ExchangeKeys(sess)
+			if err != nil {
+				log.Fatalf("Failed to exchange keys: %v", err)
+			}
+
+			if err := SyncAuthorizedKeys(sess, keyStore); err != nil {
+				log.Printf("failed to sync authorized keys with : %v", err)
+			}
 		}
 	}
 
