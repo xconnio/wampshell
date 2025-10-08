@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -94,22 +95,15 @@ func (p *interactiveShellSession) handleShell(e *wampshell.EncryptionManager) fu
 	inv *xconn.Invocation) *xconn.InvocationResult {
 	return func(_ context.Context, inv *xconn.Invocation) *xconn.InvocationResult {
 		caller := inv.Caller()
-		key, ok := e.Key(inv.Caller())
+
+		key, ok := e.Key(caller)
 		if !ok {
 			return xconn.NewInvocationError("wamp.error.unavailable", "unavailable")
 		}
 
 		p.Lock()
-		ptmx, ok := p.ptmx[caller]
+		ptmx, exists := p.ptmx[caller]
 		p.Unlock()
-
-		if !ok {
-			_, err := p.startPtySession(inv, key.Send)
-			if err != nil {
-				return xconn.NewInvocationError("io.xconn.error", err.Error())
-			}
-			return xconn.NewInvocationError(xconn.ErrNoResult)
-		}
 
 		if inv.Progress() {
 			payload, err := inv.ArgBytes(0)
@@ -123,28 +117,58 @@ func (p *interactiveShellSession) handleShell(e *wampshell.EncryptionManager) fu
 			decrypted, err := berncrypt.DecryptChaCha20Poly1305(payload[12:], payload[:12], key.Receive)
 			if err != nil {
 				p.Lock()
-				if storedPtmx, exists := p.ptmx[caller]; exists {
-					storedPtmx.Close()
+				if stored, ok := p.ptmx[caller]; ok {
+					_ = stored.Close()
 					delete(p.ptmx, caller)
 				}
 				p.Unlock()
 				return xconn.NewInvocationError("io.xconn.error", err.Error())
 			}
 
+			if bytes.HasPrefix(decrypted, []byte("SIZE:")) {
+				var cols, rows int
+				n, _ := fmt.Sscanf(string(decrypted), "SIZE:%d:%d", &cols, &rows)
+				if n == 2 {
+					if cols < 0 || cols > math.MaxUint16 || rows < 0 || rows > math.MaxUint16 {
+						return xconn.NewInvocationError("wamp.error.invalid_argument", "invalid size")
+					}
+					if !exists {
+						newPt, err := p.startPtySession(inv, key.Send)
+						if err != nil {
+							return xconn.NewInvocationError("io.xconn.error", err.Error())
+						}
+						ptmx = newPt
+					}
+					winsize := &pty.Winsize{
+						Cols: uint16(cols), // #nosec G115
+						Rows: uint16(rows), // #nosec G115
+					}
+					_ = pty.Setsize(ptmx, winsize)
+				}
+				return xconn.NewInvocationError(xconn.ErrNoResult)
+			}
+
+			if !exists {
+				newPt, err := p.startPtySession(inv, key.Send)
+				if err != nil {
+					return xconn.NewInvocationError("io.xconn.error", err.Error())
+				}
+				ptmx = newPt
+			}
+
 			_, err = ptmx.Write(decrypted)
 			if err != nil {
-				log.Printf("Failed to write to PTY for caller %d: %v", caller, err)
 				return xconn.NewInvocationError("io.xconn.error", err.Error())
 			}
 			return xconn.NewInvocationError(xconn.ErrNoResult)
 		}
 
 		p.Lock()
-		delete(p.ptmx, caller)
-		p.Unlock()
-		if ok {
-			ptmx.Close()
+		if stored, ok := p.ptmx[caller]; ok {
+			_ = stored.Close()
+			delete(p.ptmx, caller)
 		}
+		p.Unlock()
 
 		return xconn.NewInvocationResult()
 	}

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"github.com/jessevdk/go-flags"
 	"golang.org/x/term"
@@ -19,6 +21,7 @@ import (
 
 const (
 	defaultRealm             = "wampshell"
+	nonceSize                = 12
 	procedureInteractive     = "wampshell.shell.interactive"
 	procedureExec            = "wampshell.shell.exec"
 	procedureWebRTCOffer     = "wampshell.webrtc.offer"
@@ -27,8 +30,6 @@ const (
 )
 
 func startInteractiveShell(session *xconn.Session, keys *wampshell.KeyPair) error {
-	const nonceSize = 12
-
 	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
@@ -36,26 +37,56 @@ func startInteractiveShell(session *xconn.Session, keys *wampshell.KeyPair) erro
 	}
 	defer func() { _ = term.Restore(fd, oldState) }()
 
-	firstProgress := true
+	progressChan := make(chan *xconn.Progress, 32)
 
-	readAndEncrypt := func() (*xconn.Progress, error) {
-		buf := make([]byte, 1024)
-		n, err := os.Stdin.Read(buf)
+	sendSize := func() *xconn.Progress {
+		width, height, err := term.GetSize(fd)
 		if err != nil {
-			return nil, fmt.Errorf("read error: %w", err)
+			return nil
 		}
-
-		ciphertext, nonce, err := berncrypt.EncryptChaCha20Poly1305(buf[:n], keys.Send)
+		msg := fmt.Sprintf("SIZE:%d:%d", width, height)
+		ciphertext, nonce, err := berncrypt.EncryptChaCha20Poly1305([]byte(msg), keys.Send)
 		if err != nil {
-			return nil, fmt.Errorf("encryption error: %w", err)
+			return nil
 		}
 		payload := append(nonce, ciphertext...)
-		return xconn.NewProgress(payload), nil
+		return xconn.NewProgress(payload)
 	}
+
+	if p := sendSize(); p != nil {
+		progressChan <- p
+	}
+
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGWINCH)
+		for range sigChan {
+			if p := sendSize(); p != nil {
+				progressChan <- p
+			}
+		}
+	}()
+
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil {
+				close(progressChan)
+				return
+			}
+			ciphertext, nonce, err := berncrypt.EncryptChaCha20Poly1305(buf[:n], keys.Send)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "encryption error:", err)
+				continue
+			}
+			progressChan <- xconn.NewProgress(append(nonce, ciphertext...))
+		}
+	}()
 
 	decryptAndWrite := func(encData []byte) error {
 		if len(encData) < nonceSize {
-			return fmt.Errorf("invalid payload from server: too short")
+			return fmt.Errorf("invalid payload from server")
 		}
 		plain, err := berncrypt.DecryptChaCha20Poly1305(encData[nonceSize:], encData[:nonceSize], keys.Receive)
 		if err != nil {
@@ -67,16 +98,11 @@ func startInteractiveShell(session *xconn.Session, keys *wampshell.KeyPair) erro
 
 	call := session.Call(procedureInteractive).
 		ProgressSender(func(ctx context.Context) *xconn.Progress {
-			if firstProgress {
-				firstProgress = false
-				return xconn.NewProgress()
-			}
-			progress, err := readAndEncrypt()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, err)
+			p, ok := <-progressChan
+			if !ok {
 				return xconn.NewFinalProgress()
 			}
-			return progress
+			return p
 		}).
 		ProgressReceiver(func(result *xconn.InvocationResult) {
 			if len(result.Args) > 0 {
@@ -115,7 +141,8 @@ func runCommand(session *xconn.Session, keys *wampshell.KeyPair, args []string) 
 		return fmt.Errorf("output parsing error: %w", err)
 	}
 
-	plainOutput, err := berncrypt.DecryptChaCha20Poly1305(encryptedOutput[12:], encryptedOutput[:12], keys.Receive)
+	plainOutput, err := berncrypt.DecryptChaCha20Poly1305(encryptedOutput[nonceSize:],
+		encryptedOutput[:nonceSize], keys.Receive)
 	if err != nil {
 		return fmt.Errorf("decryption failed: %w", err)
 	}
