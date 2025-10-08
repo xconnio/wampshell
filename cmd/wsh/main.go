@@ -151,8 +151,9 @@ func runCommand(session *xconn.Session, keys *wampshell.KeyPair, args []string) 
 }
 
 type Options struct {
-	Interactive bool `short:"i" long:"interactive" description:"Force interactive shell"`
-	PeerToPeer  bool `long:"p2p" description:"Use WebRTC for peer-to-peer connection"`
+	Interactive bool   `short:"i" long:"interactive" description:"Force interactive shell"`
+	PeerToPeer  bool   `long:"p2p" description:"Use WebRTC for peer-to-peer connection"`
+	Realm       string `long:"realm" description:"Realm to access"`
 	Args        struct {
 		Target string   `positional-arg-name:"host" required:"true"`
 		Cmd    []string `positional-arg-name:"command"`
@@ -166,6 +167,11 @@ func main() {
 	_, err := parser.Parse()
 	if err != nil {
 		log.Fatalln(err)
+	}
+
+	realm := opts.Realm
+	if realm == "" {
+		realm = defaultRealm
 	}
 
 	target := opts.Args.Target
@@ -207,14 +213,14 @@ func main() {
 
 	url := fmt.Sprintf("rs://%s:%s", host, port)
 
-	session, err := client.Connect(context.Background(), url, defaultRealm)
+	session, err := client.Connect(context.Background(), url, realm)
 	if err != nil {
 		log.Fatalf("Failed to connect via TCP: %v", err)
 	}
 
 	if opts.PeerToPeer {
 		config := &wamp_webrtc_go.ClientConfig{
-			Realm:                    defaultRealm,
+			Realm:                    realm,
 			ProcedureWebRTCOffer:     procedureWebRTCOffer,
 			TopicAnswererOnCandidate: topicAnswererOnCandidate,
 			TopicOffererOnCandidate:  topicOffererOnCandidate,
